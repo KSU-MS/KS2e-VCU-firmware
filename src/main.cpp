@@ -15,14 +15,14 @@
 #include "inverter.hpp"
 #include "accumulator.hpp"
 #include "state_machine.hpp"
-#include "device_status.h"
+#include "ksu_device_status.h"
 
 #define NEBUG
 static can_obj_ksu_ev_can_h_t ksu_can;
 // Metro timers for inverter:
 Metro timer_mc_kick_timer = Metro(50, 1); // Motor controller heartbeat timer
 Metro timer_inverter_enable = Metro(2000, 1); // Timeout for inverter enabling
-Metro timer_motor_controller_send = Metro(10, 1); // Motor controller torque command timer
+Metro timer_motor_controller_send = Metro(5, 1); // Motor controller torque command timer
 Metro timer_current_limit_send = Metro(10, 1); // Motor controller power limiting timer
 
 // timers for the accumulator:
@@ -58,13 +58,16 @@ Metro timer_can_update = Metro(1000, 1);
 // Wheel speed shit
 FreqMeasureMulti wsfl;
 FreqMeasureMulti wsfr;
-
+#define ENABLED_LC_TYPES {launchControlTypes_e::LC_DRIVERCONTROL,launchControlTypes_e::LC_LINEAR,launchControlTypes_e::LC_PID}
+#define ENABLED_TC_TYPES {torque_control_types_e::TC_DRIVERCONTROL,torque_control_types_e::TC_PID,torque_control_types_e::TC_SlipTime}
 // objects
 Dashboard dash;
 Inverter pm100(&timer_mc_kick_timer, &timer_inverter_enable, &timer_motor_controller_send, &timer_current_limit_send, &dash);
 Accumulator accum(&precharge_timeout,&ksu_can);
 PedalHandler pedals(&timer_debug_pedals_raw, &pedal_out_20hz, &pedal_out_1hz, &speedPID, &current_rpm, &set_rpm, &throttle_out, &wsfl, &wsfr);
-StateMachine state_machine(&pm100, &accum, &timer_ready_sound, &dash, &debug_tim, &pedals, &pedal_check);
+launchControlSystem launchSystem(ENABLED_LC_TYPES); // THIS WILL INCLUDE *ALL* LAUNCH MODES BY DEFAULT
+torque_control_system tractionControlSystem(ENABLED_TC_TYPES);
+StateMachine state_machine(&pm100, &accum, &timer_ready_sound, &dash, &debug_tim, &pedals, &launchSystem, &tractionControlSystem, &pedal_check, &ksu_can);
 MCU_status mcu_status = MCU_status();
 
 static CAN_message_t mcu_status_msg;
@@ -100,6 +103,7 @@ int16_t dummy_motor_speed = 1000;
 void setup()
 {
     Serial.begin(57600);
+    Serial.setTimeout(0);
     delay(100);
 
     InitCAN();
@@ -117,8 +121,15 @@ void setup()
     memcpy(fw_hash_msg.buf, &vcu_status_t, sizeof(vcu_status_t));
 
     mcu_status.set_inverter_powered(true); // note VCU does not control inverter power on rev3
-    mcu_status.set_torque_mode(1);         // TODO torque modes should be an enum
-    mcu_status.set_max_torque(TORQUE_1);   // TORQUE_1=10nm, 2=54nm, 3=180nm, 4=240nm
+    uint8_t last_mode = 1;
+    EEPROM.get(TORQUE_MODE_EEPROM_ADDR,last_mode);
+    if (last_mode > 4 || last_mode < 1)
+    {
+        last_mode = 3;
+    }
+    Serial.printf("Last torque mode (from EEPROM: %d)\n",last_mode);
+    mcu_status.set_torque_mode(last_mode);         // TODO torque modes should be an enum
+    mcu_status.set_max_torque(torque_mode_list[last_mode-1]);   // TORQUE_1=10nm, 2=54nm, 3=180nm, 4=240nm
     state_machine.init_state_machine(mcu_status);
 }
 
@@ -143,6 +154,8 @@ void loop()
         vcu_status_t.on_time_seconds = millis() / 1000;
         memcpy(fw_hash_msg.buf, &vcu_status_t, sizeof(vcu_status_t));
         WriteCANToInverter(fw_hash_msg);
+
+        sendStructOnCan(state_machine.get_lifetime_data(),ID_VCU_LIFETIME_DATA);
 
         // broadcast pedal thresholds information
         pedal_thresholds_msg.id = ID_VCU_PEDAL_THRESHOLD_SETTINGS;

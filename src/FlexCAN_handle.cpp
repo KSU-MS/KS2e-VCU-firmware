@@ -1,8 +1,12 @@
 #include "FlexCAN_util.hpp"
-
+#include "state_machine.hpp"
 FlexCAN_T4<CAN3, RX_SIZE_1024, TX_SIZE_1024> DaqCAN_;
 FlexCAN_T4<CAN2, RX_SIZE_1024, TX_SIZE_1024> Inverter_CAN_;
 FlexCAN_T4<CAN1, RX_SIZE_1024, TX_SIZE_1024> AccumulatorCAN_;
+
+// number of rx and tx mailboxes
+#define NUM_TX_MAILBOXES 32
+#define NUM_RX_MAILBOXES 32
 
 void InitCAN()
 {

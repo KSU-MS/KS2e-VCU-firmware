@@ -40,6 +40,12 @@ int16_t Accumulator::get_acc_current(){
     return pack_current;
 }
 
+double Accumulator::get_acc_voltage(){
+    double acc_v;
+    decode_can_0x6b2_Pack_Inst_Voltage(this->acc_ksu_can,&acc_v);
+    return acc_v;
+}
+
 void Accumulator::update_acc_state(){
     if (bms_curr_lim_info.Pack_DCL <= 0 ){
         acc_ok = false;

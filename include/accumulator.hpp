@@ -40,6 +40,7 @@ public:
     bool GetIfPrechargeAttempted();
     void resetPchgState();
     int16_t get_acc_current();
+    double get_acc_voltage();
     bool get_imd_state();
     bool get_bms_state();
     bool get_acc_state();
