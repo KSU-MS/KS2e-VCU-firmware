@@ -3,7 +3,7 @@ name: PlatformIO CI
 on: [push]
 
 jobs:
-  build-and-upload:
+  test-build-upload:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,11 +20,14 @@ jobs:
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
 
+      - name: run platformio tests
+        run: pio test -e test_env -v
+
       - name: Build PlatformIO Project
-        run: pio run
+        run: pio run -e teensy41 -v
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.sha }}-teensy-hex
           path: .pio/build/teensy41/firmware.hex

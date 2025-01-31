@@ -34,7 +34,7 @@ void Inverter::updateInverterCAN()
         case (ID_MC_VOLTAGE_INFORMATION):
         {
             pm100Voltage.load(rxMsg.buf);
-
+            update_power();
             break;
         }
         case (ID_MC_MOTOR_POSITION_INFORMATION):
@@ -61,23 +61,14 @@ void Inverter::updateInverterCAN()
         case (ID_DASH_BUTTONS):
         {
             uint8_t new_inputs = rxMsg.buf[0];
-            float timestamp = millis() / float(1000);
-        #if DEBUG
-            Serial.printf("Dash last received interval: %f\n", (timestamp - (dash->last_received_timestamp)));
-        #endif
-            dash->last_received_timestamp = timestamp;
-            for (int i = 0; i < 6; i++)
-            {
-                uint8_t bit = (0x1 << i);
-                bool new_val = new_inputs & bit;
-                bool old_val = (dash->get_buttons() & bit);
-                if (new_val != old_val)
-                {
-                    Serial.printf("Button number %d changed from %d to %d",i+1,old_val,new_val);
-                    dash->set_button_last_pressed_time(0,i);
-                }
-            }
-            dash->set_buttons(new_inputs);
+            dash->update_dash(new_inputs);
+        }
+        case (ID_MC_CURRENT_INFORMATION):
+        {
+            pm100CurrentInfo.load(rxMsg.buf);
+            // Update our current power estimate, dividing both V & I as they are multiplied by 10 as received
+            update_power();
+            break;
         }
         default:
             break;
@@ -109,42 +100,43 @@ void Inverter::writeEnableNoTorque()
 
 /**
  * @brief Sends torque command to the inverter
- * 
+ *
  * @param torque the 0 - 3000 torque value (in Nm x 10)
  * @return true if sent succesfully
  * @return false if not
  */
-bool Inverter::command_torque(int torque)
+bool Inverter::command_torque(int16_t torque)
 {
-    uint8_t torquePart1 = torque % 256;
-    uint8_t torquePart2 = torque / 256;
+    uint16_t max_torque = TORQUE_4 * 10;
+    // For now, this will not allow negative torque (regen)
+    if (torque > (TORQUE_4 * 10))
+    {
+        torque = TORQUE_4*10;
+    }
+    else if (torque < 0)
+    {
+        torque = 0;
+    }
     uint8_t angularVelocity1 = 0, angularVelocity2 = 0;
-    bool emraxDirection = true; // true for forward, false for reverse
     bool inverterEnable = true; // go brrr
-    // // TODO actual regen mapping and not on/off, this was jerky on dyno
-    //  if(pedals->VCUPedalReadings.get_brake_transducer_1()>=1950){
-    //    torquePart1=0x9C;
-    //    torquePart2=0xFf; //-10nm sussy regen
-    //  }
+
     uint8_t torqueCommand[] = {
-        torquePart1, torquePart2, angularVelocity1, angularVelocity2, emraxDirection, inverterEnable, 0, 0};
+        0, 0, angularVelocity1, angularVelocity2, spinForward, inverterEnable, 0, 0};
+    memcpy(&torqueCommand[0], &torque, sizeof(torque));
+    memcpy(&torqueCommand[6],&max_torque, sizeof(max_torque));
+    // Send torque command if timer has fired
     if (timer_motor_controller_send->check())
     {
         CAN_message_t ctrlMsg;
         ctrlMsg.len = 8;
         ctrlMsg.id = ID_MC_COMMAND_MESSAGE;
         memcpy(ctrlMsg.buf, torqueCommand, sizeof(ctrlMsg.buf));
-        if (WriteCANToInverter(ctrlMsg))
-        {
-            return true;
-        }
-        else
-        {
-            return false;
-        }
+        return (WriteCANToInverter(ctrlMsg));
     }
-
-    return true;
+    else // do nothing
+    {
+        return false;
+    }
 }
 
 //
@@ -183,7 +175,7 @@ void Inverter::inverter_kick(bool enable)
         CAN_message_t ctrlMsg;
         ctrlMsg.len = 8;
         ctrlMsg.id = ID_MC_COMMAND_MESSAGE;
-        uint8_t heartbeatMsg[] = {0, 0, 0, 0, 1, enable, 0, 0};
+        uint8_t heartbeatMsg[] = {0, 0, 0, 0, spinForward, enable, 0, 0}; // TODO: Tie this into other guy for direction change flag
         memcpy(ctrlMsg.buf, heartbeatMsg, sizeof(ctrlMsg.buf));
         WriteCANToInverter(ctrlMsg);
     }
@@ -215,7 +207,7 @@ void Inverter::forceMCdischarge()
             CAN_message_t ctrlMsg;
             ctrlMsg.len = 8;
             ctrlMsg.id = ID_MC_COMMAND_MESSAGE;
-            uint8_t dischgMsg[] = {0, 0, 0, 0, 1, 0b0000010, 0, 0}; // bit one?
+            uint8_t dischgMsg[] = {0, 0, 0, 0, spinForward, 0b0000010, 0, 0}; // bit one? // Maybe this as well for backwards msg???
             memcpy(ctrlMsg.buf, dischgMsg, sizeof(ctrlMsg.buf));
             WriteCANToInverter(ctrlMsg);
         }
@@ -268,8 +260,14 @@ bool Inverter::calc_and_send_current_limit(uint16_t pack_voltage, uint32_t disch
 {
     pack_voltage /= 10;
     uint16_t discharge_current_limit = min((discharge_power_limit) / pack_voltage, accumulator_max_discharge_current);
+#if DEBUG
+    if (pm100temp3.get_motor_temperature() > 850)
+    {
+        discharge_current_limit = 15000 / pack_voltage;
+    }
+#endif
     uint16_t charge_current_limit = min((charge_power_limit / pack_voltage), accumulator_max_charge_current);
-    if (timer_current_limit->check())
+    if (timer_current_limit->check() && (discharge_power_limit<80000))
     {
 #if DEBUG
         Serial.printf("discharge current limit: %d charge current limit: %d\n", discharge_current_limit, charge_current_limit);

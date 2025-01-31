@@ -6,9 +6,9 @@ Metro debugPrint = Metro(100);
 void PedalHandler::init_pedal_handler()
 {
     // TODO don't htink you actually have to init analog GPIOs on teensy
-    // for(int i; i < sizeof(analog_init_list)/sizeof(int);i++){
-    //     pinMode(analog_init_list[i],INPUT);
-    // }
+    for(int i = 0; i < sizeof(analog_init_list)/sizeof(analog_init_list[0]);i++){
+        pinMode(analog_init_list[i],INPUT);
+    }
     pedal_ADC = ADC_SPI(CS_ADC, DEFAULT_SPI_SPEED);
     pid_->setTimeStep(PID_TIMESTEP);
     wsfl_->begin(WSFL);
@@ -22,6 +22,10 @@ void PedalHandler::run_pedals()
     this->bse1.sensor_run();
 }
 
+float PedalHandler::getAppsTravel()
+{
+    return (this->apps1.getTravelRatio() + this->apps2.getTravelRatio())/2;
+}
 /**
  * @brief calculate torque to be commanded based on accel pedal position
  * 
@@ -44,9 +48,9 @@ int16_t PedalHandler::calculate_torque(int16_t &motor_speed, int &max_torque)
     {
         torque2 = max_torque;
     }
-    // Use average of the two APPS torque results to calculate the torque request
 
-    calculated_torque = (torque1 + torque2) / 2; // TODO un-cheese this
+    // Use average of the two APPS torque results to calculate the torque request
+    calculated_torque = (torque1 + torque2) / 2;
 
     if (calculated_torque > max_torque)
     {
@@ -74,8 +78,7 @@ int16_t PedalHandler::calculate_regen(int16_t &motor_speed, int16_t max_regen_to
     const int16_t regen_torque_maximum = REGEN_NM * -10;
     calculated_regen_torque = this->bse1.getTravelRatio() * regen_torque_maximum;
     // Smooth regen torque so it doesnt yeet driveline
-    // TODO find out what this limits the rate of change to
-    smoothed_regen_torque = 0.8 * smoothed_regen_torque + (1-0.8) * calculated_regen_torque;
+    smoothed_regen_torque = FILTERING_ALPHA_1HZ * smoothed_regen_torque + (1-FILTERING_ALPHA_1HZ) * calculated_regen_torque;
     #if DEBUG
     Serial.printf("Calculated regen: %d smoothed regen: %d",calculated_regen_torque,smoothed_regen_torque);
     #endif
@@ -134,8 +137,12 @@ bool PedalHandler::read_pedal_values()
  * @brief send pedal readings over CAN, with timers built in to function
  * 
  */
-void PedalHandler::send_readings()
+bool PedalHandler::send_readings()
 {
+#if DEBUG
+    print_cal_values();
+#endif
+    bool sent = false;
     if (pedal_out_20hz->check())
     {
         // Send Main Control Unit pedal reading message @ 20hz
@@ -152,8 +159,17 @@ void PedalHandler::send_readings()
         int16_t rpm_wsfr = (int16_t)(wsfr_t.current_rpm);
         int16_t rpm_buf[]={rpm_wsfl,rpm_wsfr};
         memcpy(&tx_msg2.buf[0], &rpm_buf, sizeof(rpm_buf));
-        WriteCANToInverter(tx_msg);
-        WriteCANToInverter(tx_msg2);
+
+        CAN_message_t tx_msg3;
+        // Send pedal travel readings @ 20hz
+        tx_msg3.id = ID_VCU_PEDAL_TRAVEL;
+        pedal_travels_t readings = this->get_pedal_travels();
+        tx_msg3.len = sizeof(readings);
+        memcpy(tx_msg3.buf,&readings,sizeof(readings));
+
+        sent = WriteCANToInverter(tx_msg);
+        sent = WriteCANToInverter(tx_msg2);
+        sent = WriteCANToInverter(tx_msg3);
     }
     if (pedal_out_1hz->check())
     {
@@ -174,6 +190,7 @@ void PedalHandler::send_readings()
         WriteCANToInverter(tx_msg3);
         WriteCANToInverter(tx_msg4);
     }
+    return sent;
 }
 
 /**
@@ -195,6 +212,7 @@ void PedalHandler::verify_pedals(
     float torqSum = abs(torque1 - torque2);
     float torqAvg = (torque1 + torque2) / 2;
     float torqDiff = torqSum / torqAvg;
+    bool apps_above_tiny_travel = ((this->apps1.getTravelRatio() > 0.1) || (this->apps2.getTravelRatio() > 0.1));
 
     if (accel1_ < MIN_ACCELERATOR_PEDAL_1 ||
         accel1_ > MAX_ACCELERATOR_PEDAL_1)
@@ -209,8 +227,12 @@ void PedalHandler::verify_pedals(
     // check that the pedals are reading within 10% of each other TODO re-enabled 6/10/23, why was it commented out in the first place? how did we fix it before??
     // sum of the two readings should be within 10% of the average travel
     // T.4.2.4
-    else if (torqDiff * 100 > APPS_ALLOWABLE_TRAVEL_DEVIATION)
+    else if ((torqDiff * 100 > APPS_ALLOWABLE_TRAVEL_DEVIATION) && apps_above_tiny_travel)
     {
+#if DEBUG
+        Serial.printf("torqdiff: %f\n",torqDiff);
+        Serial.printf("%d %d\n",torque1,torque2);
+#endif
         accel_is_plausible = false;
     }
     else
@@ -270,8 +292,10 @@ void PedalHandler::verify_pedals(
 }
 
 // idgaf anything below (all wheel speed)
-double PedalHandler::get_wsfr() { return wsfr_t.current_rpm; }
-double PedalHandler::get_wsfl() { return wsfl_t.current_rpm; }
+//Get front right WS reading
+float PedalHandler::get_wsfr() { return wsfr_t.current_rpm; }
+//Get front left WS reading
+float PedalHandler::get_wsfl() { return wsfl_t.current_rpm; }
 /**
  * @brief update wheel speed readings
  * 
@@ -279,32 +303,38 @@ double PedalHandler::get_wsfl() { return wsfl_t.current_rpm; }
  * @param ws 
  * @param freq 
  */
-void PedalHandler::update_wheelspeed(unsigned long current_time_millis, wheelspeeds_t *ws, FreqMeasureMulti *freq){
-    if ((current_time_millis - ws->current_rpm_change_time) > RPM_TIMEOUT) 
-    { 
+void PedalHandler::update_wheelspeed(unsigned long current_time_millis, wheelspeeds_t *ws, FreqMeasureMulti *freq) {
+    if ((current_time_millis - ws->current_rpm_change_time) > RPM_TIMEOUT) {
         ws->current_rpm = 0;
     }
-    if (freq->available()){
-        // average several reading together
+
+    if (freq->available()) {
+        // average several readings together
         ws->sum = ws->sum + freq->read();
         ws->count = ws->count + 1;
         ws->current_rpm_change_time = millis();
-        if (ws->count > 1)
-        {
+
+        if (ws->count > 1) {
             float testRpm = freq->countToFrequency(ws->sum / ws->count) * 60 / WHEELSPEED_TOOTH_COUNT;
+            if (testRpm > 6000) {
+                testRpm = ws->current_rpm;
+            }
             ws->current_rpm = testRpm;
 
-            /*if ( testRpm - prev_rpm < 1)
-            {
-              current_rpm = testRpm;
-              prev_rpm = testRpm;
-            }*/
+            // Update the buffer with the new RPM value
+            ws->rpm_buffer[ws->buffer_index] = ws->current_rpm;
+            ws->buffer_index = (ws->buffer_index + 1) % BUFFER_SIZE;
+
+            // Calculate the rolling average
+            float sum = 0;
+            for (int i = 0; i < BUFFER_SIZE; i++) {
+                sum += ws->rpm_buffer[i];
+            }
+            ws->current_rpm = sum / BUFFER_SIZE;
 
             ws->sum = 0;
             ws->count = 0;
-            // prev_rpm = testRpm;
         }
-
     }
 }
 
@@ -365,5 +395,22 @@ void PedalHandler::read_pedal_values_debug(uint16_t value)
         // Serial.printf("apps2: %f %f\n",this->apps2.getVoltage(),this->apps2.getTravelRatio());
         // Serial.printf("bse1: %f %f\n",this->bse1.getVoltage(),this->bse1.getTravelRatio());
 #endif
+    }
+}
+
+void PedalHandler::print_cal_values()
+{
+    static uint16_t a1,a2,b1;
+    static uint16_t ma1,ma2,mb1;
+    if (millis() > 10000)
+    { 
+        a1 = accel1_>a1 ? accel1_:a1;
+        a2 = accel2_>a2 ? accel2_:a2;
+        b1 = brake1_>b1 ? brake1_:b1;
+        Serial.printf("maxes APPS1: %d APPS2: %d BSE1: %d\n",accel1_,accel2_,brake1_);
+        // ma1 = accel1_<ma1 ? accel1_:ma1;
+        // ma2 = accel2_<ma2 ? accel2_:ma2;
+        // mb1 = brake1_<mb1 ? brake1_:mb1;
+        // Serial.printf("mins APPS1: %d APPS2: %d BSE1: %d\n",ma1,ma2,mb1);
     }
 }

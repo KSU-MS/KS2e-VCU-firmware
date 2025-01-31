@@ -18,7 +18,13 @@ enum class MCU_STATE
 // @Parseclass @Custom(parse_mcu_enums)
 class MCU_status {
 public:
-    MCU_status() = default;
+    MCU_status() : 
+        shutdown_states(0xff), 
+        pedal_states(0), 
+        ecu_states(0), 
+        max_torque(0), 
+        torque_mode(0), 
+        distance_travelled(0) {}
     MCU_status(const uint8_t buf[8]) { load(buf); }
 
     inline void load(const uint8_t buf[])  { memcpy(this, buf, sizeof(*this)); }
